@@ -25,7 +25,7 @@ import (
 	"k8s.io/kubernetes/pkg/cloudprovider"
 )
 
-func (c *Cloud) findRouteTable(clusterName string) (*ec2.RouteTable, error) {
+func (c *Cloud) findRouteTables(clusterName string) ([]*ec2.RouteTable, error) {
 	// This should be unnecessary (we already filter on TagNameKubernetesCluster,
 	// and something is broken if cluster name doesn't match, but anyway...
 	// TODO: All clouds should be cluster-aware by default
@@ -41,16 +41,18 @@ func (c *Cloud) findRouteTable(clusterName string) (*ec2.RouteTable, error) {
 		return nil, fmt.Errorf("unable to find route table for AWS cluster: %s", clusterName)
 	}
 
-	if len(tables) != 1 {
-		return nil, fmt.Errorf("found multiple matching AWS route tables for AWS cluster: %s", clusterName)
-	}
-	return tables[0], nil
+	/*
+		if len(tables) != 1 {
+			return nil, fmt.Errorf("found multiple matching AWS route tables for AWS cluster: %s", clusterName)
+		}
+	*/
+	return tables, nil
 }
 
 // ListRoutes implements Routes.ListRoutes
 // List all routes that match the filter
 func (c *Cloud) ListRoutes(clusterName string) ([]*cloudprovider.Route, error) {
-	table, err := c.findRouteTable(clusterName)
+	tables, err := c.findRouteTables(clusterName)
 	if err != nil {
 		return nil, err
 	}
@@ -58,14 +60,16 @@ func (c *Cloud) ListRoutes(clusterName string) ([]*cloudprovider.Route, error) {
 	var routes []*cloudprovider.Route
 	var instanceIDs []*string
 
-	for _, r := range table.Routes {
-		instanceID := orEmpty(r.InstanceId)
+	for _, table := range tables {
+		for _, r := range table.Routes {
+			instanceID := orEmpty(r.InstanceId)
 
-		if instanceID == "" {
-			continue
+			if instanceID == "" {
+				continue
+			}
+
+			instanceIDs = append(instanceIDs, &instanceID)
 		}
-
-		instanceIDs = append(instanceIDs, &instanceID)
 	}
 
 	instances, err := c.getInstancesByIDs(instanceIDs)
@@ -73,24 +77,25 @@ func (c *Cloud) ListRoutes(clusterName string) ([]*cloudprovider.Route, error) {
 		return nil, err
 	}
 
-	for _, r := range table.Routes {
-		instanceID := orEmpty(r.InstanceId)
-		destinationCIDR := orEmpty(r.DestinationCidrBlock)
+	for _, table := range tables {
+		for _, r := range table.Routes {
+			instanceID := orEmpty(r.InstanceId)
+			destinationCIDR := orEmpty(r.DestinationCidrBlock)
 
-		if instanceID == "" || destinationCIDR == "" {
-			continue
-		}
+			if instanceID == "" || destinationCIDR == "" {
+				continue
+			}
 
-		instance, found := instances[instanceID]
-		if !found {
-			glog.Warningf("unable to find instance ID %s in the list of instances being routed to", instanceID)
-			continue
+			instance, found := instances[instanceID]
+			if !found {
+				glog.Warningf("unable to find instance ID %s in the list of instances being routed to", instanceID)
+				continue
+			}
+			nodeName := mapInstanceToNodeName(instance)
+			routeName := clusterName + "-" + destinationCIDR
+			routes = append(routes, &cloudprovider.Route{Name: routeName, TargetNode: nodeName, DestinationCIDR: destinationCIDR})
 		}
-		nodeName := mapInstanceToNodeName(instance)
-		routeName := clusterName + "-" + destinationCIDR
-		routes = append(routes, &cloudprovider.Route{Name: routeName, TargetNode: nodeName, DestinationCIDR: destinationCIDR})
 	}
-
 	return routes, nil
 }
 
@@ -122,66 +127,68 @@ func (c *Cloud) CreateRoute(clusterName string, nameHint string, route *cloudpro
 		return err
 	}
 
-	table, err := c.findRouteTable(clusterName)
+	tables, err := c.findRouteTables(clusterName)
 	if err != nil {
 		return err
 	}
 
-	var deleteRoute *ec2.Route
-	for _, r := range table.Routes {
-		destinationCIDR := aws.StringValue(r.DestinationCidrBlock)
+	for _, table := range tables {
+		var deleteRoute *ec2.Route
+		for _, r := range table.Routes {
+			destinationCIDR := aws.StringValue(r.DestinationCidrBlock)
 
-		if destinationCIDR != route.DestinationCIDR {
-			continue
+			if destinationCIDR != route.DestinationCIDR {
+				continue
+			}
+
+			if aws.StringValue(r.State) == ec2.RouteStateBlackhole {
+				deleteRoute = r
+			}
 		}
 
-		if aws.StringValue(r.State) == ec2.RouteStateBlackhole {
-			deleteRoute = r
+		if deleteRoute != nil {
+			glog.Infof("deleting blackholed route: %s", aws.StringValue(deleteRoute.DestinationCidrBlock))
+
+			request := &ec2.DeleteRouteInput{}
+			request.DestinationCidrBlock = deleteRoute.DestinationCidrBlock
+			request.RouteTableId = table.RouteTableId
+
+			_, err = c.ec2.DeleteRoute(request)
+			if err != nil {
+				return fmt.Errorf("error deleting blackholed AWS route (%s): %v", aws.StringValue(deleteRoute.DestinationCidrBlock), err)
+			}
 		}
-	}
 
-	if deleteRoute != nil {
-		glog.Infof("deleting blackholed route: %s", aws.StringValue(deleteRoute.DestinationCidrBlock))
-
-		request := &ec2.DeleteRouteInput{}
-		request.DestinationCidrBlock = deleteRoute.DestinationCidrBlock
+		request := &ec2.CreateRouteInput{}
+		// TODO: use ClientToken for idempotency?
+		request.DestinationCidrBlock = aws.String(route.DestinationCIDR)
+		request.InstanceId = instance.InstanceId
 		request.RouteTableId = table.RouteTableId
 
-		_, err = c.ec2.DeleteRoute(request)
+		_, err = c.ec2.CreateRoute(request)
 		if err != nil {
-			return fmt.Errorf("error deleting blackholed AWS route (%s): %v", aws.StringValue(deleteRoute.DestinationCidrBlock), err)
+			return fmt.Errorf("error creating AWS route (%s): %v", route.DestinationCIDR, err)
 		}
 	}
-
-	request := &ec2.CreateRouteInput{}
-	// TODO: use ClientToken for idempotency?
-	request.DestinationCidrBlock = aws.String(route.DestinationCIDR)
-	request.InstanceId = instance.InstanceId
-	request.RouteTableId = table.RouteTableId
-
-	_, err = c.ec2.CreateRoute(request)
-	if err != nil {
-		return fmt.Errorf("error creating AWS route (%s): %v", route.DestinationCIDR, err)
-	}
-
 	return nil
 }
 
 // DeleteRoute implements Routes.DeleteRoute
 // Delete the specified route
 func (c *Cloud) DeleteRoute(clusterName string, route *cloudprovider.Route) error {
-	table, err := c.findRouteTable(clusterName)
+	tables, err := c.findRouteTables(clusterName)
 	if err != nil {
 		return err
 	}
 
-	request := &ec2.DeleteRouteInput{}
-	request.DestinationCidrBlock = aws.String(route.DestinationCIDR)
-	request.RouteTableId = table.RouteTableId
-
-	_, err = c.ec2.DeleteRoute(request)
-	if err != nil {
-		return fmt.Errorf("error deleting AWS route (%s): %v", route.DestinationCIDR, err)
+	for _, table := range tables {
+		request := &ec2.DeleteRouteInput{}
+		request.DestinationCidrBlock = aws.String(route.DestinationCIDR)
+		request.RouteTableId = table.RouteTableId
+		_, err = c.ec2.DeleteRoute(request)
+		if err != nil {
+			return fmt.Errorf("error deleting AWS route (%s): %v", route.DestinationCIDR, err)
+		}
 	}
 
 	return nil
