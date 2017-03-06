@@ -131,7 +131,8 @@ type Instances interface {
 type Route struct {
 	// Name is the name of the routing rule in the cloud-provider.
 	// It will be ignored in a Create (although nameHint may influence it)
-	Name string
+	Name  string
+	Table string
 	// TargetNode is the NodeName of the target instance.
 	TargetNode types.NodeName
 	// DestinationCIDR is the CIDR format IP range that this routing rule

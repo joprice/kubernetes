@@ -93,7 +93,7 @@ func (c *Cloud) ListRoutes(clusterName string) ([]*cloudprovider.Route, error) {
 			}
 			nodeName := mapInstanceToNodeName(instance)
 			routeName := clusterName + "-" + destinationCIDR
-			routes = append(routes, &cloudprovider.Route{Name: routeName, TargetNode: nodeName, DestinationCIDR: destinationCIDR})
+			routes = append(routes, &cloudprovider.Route{Name: routeName, Table: *table.RouteTableId, TargetNode: nodeName, DestinationCIDR: destinationCIDR})
 		}
 	}
 	return routes, nil

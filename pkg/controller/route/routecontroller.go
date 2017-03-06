@@ -182,7 +182,7 @@ func (rc *RouteController) reconcile(nodes []api.Node, routes []*cloudprovider.R
 				go func(route *cloudprovider.Route, startTime time.Time) {
 					glog.Infof("Deleting route %s %s", route.Name, route.DestinationCIDR)
 					if err := rc.routes.DeleteRoute(rc.clusterName, route); err != nil {
-						glog.Errorf("Could not delete route %s %s after %v: %v", route.Name, route.DestinationCIDR, time.Now().Sub(startTime), err)
+						glog.Errorf("Could not delete route %s %s from table %s after %v: %v", route.Name, route.Table, route.DestinationCIDR, time.Now().Sub(startTime), err)
 					} else {
 						glog.Infof("Deleted route %s %s after %v", route.Name, route.DestinationCIDR, time.Now().Sub(startTime))
 					}
